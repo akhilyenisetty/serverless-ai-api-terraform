@@ -22,7 +22,7 @@ Built as a focused project to learn Terraform / Infrastructure-as-Code by solvin
 - **Conversation memory** — threads are stored in your DynamoDB, keyed by `conversation_id`.
 - **Remote MCP server (`/mcp`)** — example tools (`add_note`, `search_notes`) backed by DynamoDB;
   connect Claude/Cursor/Copilot to it.
-- **A web chat UI** *(coming next stage)* — so a non-technical user just opens a page in any browser.
+- **A web chat UI** — open `ui_url`; a non-technical user just opens the page in any browser.
 
 ## Architecture
 
@@ -161,14 +161,14 @@ Python · Mangum · MCP (Model Context Protocol)
 ├── bootstrap/                 # one-time: S3 + DynamoDB for remote state
 ├── modules/
 │   ├── storage/               # DynamoDB table (chat memory + MCP notes)
-│   ├── lambda/                # IAM + Lambda (container image) + log group + alarm
+│   ├── lambda/                # IAM + Lambda (zip package) + log group + alarm
 │   └── api/                   # API Gateway HTTP API + route + permission
 ├── app/
 │   ├── mcp_server.py          # /chat agent + /mcp server + /health (+ Mangum handler)
 │   ├── requirements.txt
 │   └── Dockerfile             # optional: alternative container path (not used by the zip default)
 ├── versions.tf · providers.tf · backend.tf · variables.tf · main.tf · outputs.tf
-└── .github/workflows/         # terraform CI (later stage)
+└── .github/workflows/         # terraform CI (fmt / validate / py syntax)
 ```
 
 ## Status

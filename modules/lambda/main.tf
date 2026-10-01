@@ -109,14 +109,14 @@ resource "aws_lambda_function" "mcp" {
 
   environment {
     variables = {
-      TABLE_NAME       = var.table_name
-      COMPUTE_BACKEND  = var.compute_backend
-      BEDROCK_MODEL_ID = var.bedrock_model_id
-      LLM_PROVIDER     = var.llm_provider
-      LLM_MODEL        = var.llm_model
-      LLM_BASE_URL          = var.llm_base_url
-      SECRET_ARN            = var.secret_arn
-      EXTERNAL_MCP_SERVERS  = var.external_mcp_servers_json
+      TABLE_NAME           = var.table_name
+      COMPUTE_BACKEND      = var.compute_backend
+      BEDROCK_MODEL_ID     = var.bedrock_model_id
+      LLM_PROVIDER         = var.llm_provider
+      LLM_MODEL            = var.llm_model
+      LLM_BASE_URL         = var.llm_base_url
+      SECRET_ARN           = var.secret_arn
+      EXTERNAL_MCP_SERVERS = var.external_mcp_servers_json
     }
   }
 
