@@ -1,43 +1,36 @@
 """
-Your own remote AI backend on AWS.
+Your own remote AI backend on AWS (served from one Lambda via Mangum + API Gateway).
 
-Two things run in one Lambda (served via the Lambda Web Adapter, behind API Gateway):
+Routes:
+  GET  /        -> browser chat UI (a weak device just opens this page; compute is in the cloud)
+  POST /chat    -> chat/agent endpoint. Compute backend chosen by the operator:
+                     COMPUTE_BACKEND=bedrock -> AWS Bedrock (Converse API, runs in your AWS)
+                     COMPUTE_BACKEND=byok    -> bring-your-own-key (Anthropic / OpenAI / Grok / HF)
+                   Conversation memory persists in DynamoDB.
+  POST /mcp     -> remote MCP server (Model Context Protocol) implemented as a STATELESS
+                   JSON-RPC handler, so it works on Lambda's request/response model.
+                   Tools: add_note, search_notes (backed by DynamoDB).
+  GET  /health  -> readiness probe.
 
-  POST /chat   -> a chat/agent endpoint. Offloads heavy AI compute to the CLOUD, so a
-                  weak laptop only needs a browser. The end user chooses the compute backend:
-                    COMPUTE_BACKEND=bedrock  -> AWS Bedrock (runs in their own AWS, no external key)
-                    COMPUTE_BACKEND=byok     -> bring-your-own-key (Anthropic / OpenAI / Grok / HF)
-                  Conversation memory is persisted in DynamoDB (keyed by conversation_id).
-
-  /mcp         -> a remote MCP server (Model Context Protocol) exposing example tools
-                  (add_note, search_notes) backed by DynamoDB. Bonus feature: plug it into
-                  Claude Desktop / Cursor / Copilot.
-
-  GET  /health -> readiness probe for the Lambda Web Adapter.
-
-Env vars (set by Terraform):
-  TABLE_NAME         DynamoDB table (notes + conversation memory)
-  COMPUTE_BACKEND    "bedrock" | "byok"
-  BEDROCK_MODEL_ID   e.g. anthropic.claude-3-haiku-20240307-v1:0   (bedrock mode)
-  LLM_PROVIDER       "anthropic" | "openai" | "grok" | "huggingface"  (byok mode)
-  LLM_MODEL          provider model name                             (byok mode)
-  LLM_BASE_URL       OpenAI-compatible base URL (grok/HF)            (byok mode, optional)
-  SECRET_ARN         Secrets Manager ARN holding the API key         (byok mode)
+Env (set by Terraform): TABLE_NAME, COMPUTE_BACKEND, BEDROCK_MODEL_ID, LLM_PROVIDER,
+LLM_MODEL, LLM_BASE_URL, SECRET_ARN.
 """
 import json
 import os
 import time
 import uuid
+from decimal import Decimal
 
 import boto3
 import httpx
+from mangum import Mangum
+from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
-from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Storage (DynamoDB): used for both the MCP "notes" and chat conversation memory.
+# Storage (DynamoDB): MCP notes + chat conversation memory.
 # ---------------------------------------------------------------------------
 TABLE = os.environ.get("TABLE_NAME", "mcp-on-aws-notes")
 _table = boto3.resource("dynamodb").Table(TABLE)
@@ -49,53 +42,29 @@ def _load_history(conv_id: str) -> list:
 
 
 def _save_history(conv_id: str, messages: list) -> None:
-    _table.put_item(Item={
-        "id": f"conv#{conv_id}",
-        "messages": messages,
-        "updated_at": int(time.time()),
-    })
+    _table.put_item(Item={"id": f"conv#{conv_id}", "messages": messages, "updated_at": int(time.time())})
 
 
 # ---------------------------------------------------------------------------
-# Compute backends — the core "cloud compute for a weak laptop" piece.
+# Compute backends (the "cloud compute for a weak laptop" core).
 # ---------------------------------------------------------------------------
 BACKEND = os.environ.get("COMPUTE_BACKEND", "bedrock")
-
-
-def _generate(messages: list) -> str:
-    """Route to the configured cloud compute backend and return the model's reply text."""
-    if BACKEND == "byok":
-        return _generate_byok(messages)
-    return _generate_bedrock(messages)
-
-
-# --- AWS Bedrock: runs entirely in the user's own AWS, no external API key ---
 _bedrock = boto3.client("bedrock-runtime")
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
-
-
-def _generate_bedrock(messages: list) -> str:
-    # Bedrock Converse API: ONE unified request/response format across providers
-    # (Anthropic Claude, Amazon Nova, Meta Llama, ...). Swap models by changing
-    # BEDROCK_MODEL_ID, no code change needed.
-    resp = _bedrock.converse(
-        modelId=BEDROCK_MODEL_ID,
-        messages=[{"role": m["role"], "content": [{"text": m["content"]}]} for m in messages],
-        inferenceConfig={"maxTokens": 1024},
-    )
-    return resp["output"]["message"]["content"][0]["text"]
-
-
-# --- Bring your own key: Anthropic, or any OpenAI-compatible API (OpenAI/Grok/HF) ---
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 SECRET_ARN = os.environ.get("SECRET_ARN", "")
 
 
+def _generate(messages: list) -> str:
+    # Bedrock backend is AGENTIC: it can call the tools (see _bedrock_agent).
+    # byok stays a plain chat call.
+    return _generate_byok(messages) if BACKEND == "byok" else _bedrock_agent(messages)
+
+
 def _get_api_key() -> str:
-    val = boto3.client("secretsmanager").get_secret_value(SecretId=SECRET_ARN)["SecretString"]
-    return val.strip()
+    return boto3.client("secretsmanager").get_secret_value(SecretId=SECRET_ARN)["SecretString"].strip()
 
 
 def _generate_byok(messages: list) -> str:
@@ -109,7 +78,6 @@ def _generate_byok(messages: list) -> str:
         )
         r.raise_for_status()
         return r.json()["content"][0]["text"]
-    # openai, grok (base https://api.x.ai/v1), and many HF endpoints are OpenAI-compatible.
     r = httpx.post(
         f"{LLM_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
@@ -121,14 +89,248 @@ def _generate_byok(messages: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handlers
+# MCP tools (backed by DynamoDB) + the stateless JSON-RPC handler.
+# ---------------------------------------------------------------------------
+MCP_TOOLS = [
+    {
+        "name": "add_note",
+        "description": "Store a note in the knowledge base and return its id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+            "required": ["title", "body"],
+        },
+    },
+    {
+        "name": "search_notes",
+        "description": "Return notes whose title or body contains the query.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+]
+
+
+def _tool_add_note(title: str, body: str) -> dict:
+    note_id = str(uuid.uuid4())
+    _table.put_item(Item={"id": note_id, "title": title, "body": body, "created_at": int(time.time())})
+    return {"id": note_id, "title": title}
+
+
+def _tool_search_notes(query: str) -> list:
+    q = query.lower()
+    items = _table.scan().get("Items", [])
+    return [i for i in items if q in i.get("title", "").lower() or q in i.get("body", "").lower()]
+
+
+def _json_default(o):
+    # DynamoDB returns numbers as Decimal, which json.dumps can't handle natively.
+    if isinstance(o, Decimal):
+        return int(o) if o % 1 == 0 else float(o)
+    raise TypeError(f"not serializable: {type(o)}")
+
+
+def _rpc_result(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _rpc_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+async def mcp_endpoint(request):
+    # Stateless MCP over Streamable HTTP: JSON-RPC in, JSON out. No session manager,
+    # so it works within Lambda's request/response model.
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(_rpc_error(None, -32700, "Parse error"), status_code=400)
+
+    method = body.get("method")
+    req_id = body.get("id")
+
+    # Notifications (no id, e.g. notifications/initialized) just get acknowledged.
+    if req_id is None and isinstance(method, str) and method.startswith("notifications/"):
+        return PlainTextResponse("", status_code=202)
+
+    if method == "initialize":
+        proto = (body.get("params") or {}).get("protocolVersion", "2025-03-26")
+        return JSONResponse(_rpc_result(req_id, {
+            "protocolVersion": proto,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "notes-mcp", "version": "1.0.0"},
+        }))
+
+    if method == "ping":
+        return JSONResponse(_rpc_result(req_id, {}))
+
+    if method == "tools/list":
+        return JSONResponse(_rpc_result(req_id, {"tools": MCP_TOOLS}))
+
+    if method == "tools/call":
+        params = body.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        try:
+            if name == "add_note":
+                out = _tool_add_note(args["title"], args["body"])
+            elif name == "search_notes":
+                out = _tool_search_notes(args["query"])
+            else:
+                return JSONResponse(_rpc_error(req_id, -32602, f"Unknown tool: {name}"))
+            return JSONResponse(_rpc_result(req_id, {
+                "content": [{"type": "text", "text": json.dumps(out, default=_json_default)}],
+                "isError": False,
+            }))
+        except Exception as e:  # tool errors are reported in-band, per MCP
+            return JSONResponse(_rpc_result(req_id, {
+                "content": [{"type": "text", "text": f"Error: {e}"}],
+                "isError": True,
+            }))
+
+    return JSONResponse(_rpc_error(req_id, -32601, f"Method not found: {method}"))
+
+
+# ---------------------------------------------------------------------------
+# External MCP servers (option C): the chat acts as an MCP CLIENT and can connect to
+# other MCP servers you run (e.g. a WhatsApp MCP). Configure them via the
+# EXTERNAL_MCP_SERVERS env var: a JSON list of {"name","url","auth"(optional bearer)}.
+# Their tools are discovered and merged with the local ones, and the agent routes calls.
+# ---------------------------------------------------------------------------
+try:
+    _EXTERNAL_MCP = json.loads(os.environ.get("EXTERNAL_MCP_SERVERS", "[]"))
+except Exception:
+    _EXTERNAL_MCP = []
+_ext_tools = None     # cached external tool specs (discovered once per container)
+_ext_routing = {}     # tool name -> server config
+
+
+def _mcp_remote_call(server, method, params=None):
+    headers = {"content-type": "application/json", "accept": "application/json"}
+    if server.get("auth"):
+        headers["authorization"] = f"Bearer {server['auth']}"
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        payload["params"] = params
+    r = httpx.post(server["url"], headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(data["error"])
+    return data.get("result", {})
+
+
+def _discover_external():
+    global _ext_tools, _ext_routing
+    if _ext_tools is not None:
+        return
+    local_names = {t["name"] for t in MCP_TOOLS}
+    tools, routing = [], {}
+    for s in _EXTERNAL_MCP:
+        try:
+            _mcp_remote_call(s, "initialize", {"protocolVersion": "2025-03-26",
+                "capabilities": {}, "clientInfo": {"name": "cloud-ai-chat", "version": "1.0"}})
+            res = _mcp_remote_call(s, "tools/list")
+            for t in res.get("tools", []):
+                n = t.get("name")
+                if not n or n in local_names or n in routing:
+                    continue  # local tools win on name clashes
+                tools.append({"name": n, "description": t.get("description", ""),
+                              "inputSchema": t.get("inputSchema", {"type": "object", "properties": {}})})
+                routing[n] = s
+        except Exception:
+            continue  # a down/misconfigured external server must not break chat
+    _ext_tools, _ext_routing = tools, routing
+
+
+def _all_tools():
+    _discover_external()
+    return MCP_TOOLS + (_ext_tools or [])
+
+
+def _tool_config():
+    return {"tools": [
+        {"toolSpec": {"name": t["name"], "description": t["description"], "inputSchema": {"json": t["inputSchema"]}}}
+        for t in _all_tools()
+    ]}
+
+
+def _run_tool(name, args):
+    if name in _ext_routing:  # route to the external MCP server that owns this tool
+        res = _mcp_remote_call(_ext_routing[name], "tools/call", {"name": name, "arguments": args})
+        texts = [c.get("text", "") for c in res.get("content", []) if c.get("type") == "text"]
+        return "\n".join(texts) if texts else res
+    if name == "add_note":
+        return _tool_add_note(args.get("title", ""), args.get("body", ""))
+    if name == "search_notes":
+        return _tool_search_notes(args.get("query", ""))
+    return {"error": f"unknown tool: {name}"}
+
+
+def _jsonable(o):
+    return json.loads(json.dumps(o, default=_json_default))
+
+
+def _text_of(msg):
+    return "".join(b.get("text", "") for b in msg.get("content", []) if "text" in b).strip()
+
+
+def _bedrock_agent(messages_text, max_steps=8):
+    # Tool-use loop: call the model with ALL tools (local + external MCP servers); if it
+    # asks for a tool, run/route it, feed the result back, and continue until it answers.
+    conv = [{"role": m["role"], "content": [{"text": m["content"]}]} for m in messages_text]
+    tool_config = _tool_config()
+    for _ in range(max_steps):
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=conv,
+            toolConfig=tool_config,
+            inferenceConfig={"maxTokens": 1024},
+        )
+        out_msg = resp["output"]["message"]
+        conv.append(out_msg)
+        if resp.get("stopReason") != "tool_use":
+            return _text_of(out_msg)
+        results = []
+        for block in out_msg.get("content", []):
+            tu = block.get("toolUse")
+            if tu:
+                res = _run_tool(tu.get("name"), tu.get("input") or {})
+                content = [{"text": res}] if isinstance(res, str) else [{"json": _jsonable(res)}]
+                results.append({"toolResult": {"toolUseId": tu["toolUseId"], "content": content}})
+        conv.append({"role": "user", "content": results})
+    return "(stopped after too many tool steps)"
+
+
+# ---------------------------------------------------------------------------
+# HTTP handlers: health, chat, UI.
 # ---------------------------------------------------------------------------
 async def health(_request):
     return PlainTextResponse("ok")
 
 
-# Minimal browser chat UI, served from the same Lambda (same-origin, no extra infra).
-# A weak device just opens this page; all compute runs in the cloud.
+async def chat(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    message = (data.get("message") or "").strip()
+    if not message:
+        return JSONResponse({"error": "message is required"}, status_code=400)
+    conv_id = data.get("conversation_id") or str(uuid.uuid4())
+    history = _load_history(conv_id)
+    history.append({"role": "user", "content": message})
+    try:
+        reply = _generate(history[-20:])
+    except Exception as e:
+        return JSONResponse({"error": f"model call failed: {e}"}, status_code=502)
+    history.append({"role": "assistant", "content": reply})
+    _save_history(conv_id, history[-40:])
+    return JSONResponse({"conversation_id": conv_id, "reply": reply})
+
+
 UI_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -177,77 +379,15 @@ async def ui(_request):
     return HTMLResponse(UI_HTML)
 
 
-async def chat(request):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    message = (data.get("message") or "").strip()
-    if not message:
-        return JSONResponse({"error": "message is required"}, status_code=400)
-
-    conv_id = data.get("conversation_id") or str(uuid.uuid4())
-    history = _load_history(conv_id)
-    history.append({"role": "user", "content": message})
-    try:
-        reply = _generate(history[-20:])  # bound context to the last ~20 turns
-    except Exception as e:
-        return JSONResponse({"error": f"model call failed: {e}"}, status_code=502)
-    history.append({"role": "assistant", "content": reply})
-    _save_history(conv_id, history[-40:])
-    return JSONResponse({"conversation_id": conv_id, "reply": reply})
-
-
 # ---------------------------------------------------------------------------
-# MCP server (bonus feature): example tools backed by DynamoDB.
+# App + Lambda entry point.
 # ---------------------------------------------------------------------------
-mcp = FastMCP("notes-mcp", stateless_http=True)
-
-
-@mcp.tool()
-def add_note(title: str, body: str) -> dict:
-    """Store a note in the knowledge base and return its id."""
-    note_id = str(uuid.uuid4())
-    _table.put_item(Item={"id": note_id, "title": title, "body": body, "created_at": int(time.time())})
-    return {"id": note_id, "title": title}
-
-
-@mcp.tool()
-def search_notes(query: str) -> list:
-    """Return notes whose title or body contains the query (simple substring scan)."""
-    q = query.lower()
-    items = _table.scan().get("Items", [])
-    return [i for i in items if q in i.get("title", "").lower() or q in i.get("body", "").lower()]
-
-
-# ---------------------------------------------------------------------------
-# Assemble the ASGI app: the MCP app (serves /mcp) + our /chat and /health routes.
-# ---------------------------------------------------------------------------
-app = mcp.streamable_http_app()  # Starlette app; MCP endpoint lives at /mcp, lifespan wired
-app.router.routes.append(Route("/", ui, methods=["GET"]))
-app.router.routes.append(Route("/health", health, methods=["GET"]))
-app.router.routes.append(Route("/chat", chat, methods=["POST", "OPTIONS"]))
-
-# Allow the browser chat UI (added in a later stage) to call /chat.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # personal tool; tighten to your UI's origin for production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------------
-# Lambda entry point. Mangum adapts this ASGI app to Lambda/API Gateway events,
-# so no Docker and no web server are needed. Terraform sets the handler to
-# "mcp_server.handler".
-#
-# lifespan="off": the chat UI and /chat don't need an ASGI lifespan, and the MCP
-# server's session manager can only .run() once per instance, which Mangum's
-# per-invocation lifespan breaks on Lambda. Turning it off makes the core rock-solid.
-# (The /mcp bonus needs a long-lived server; deploy the container/Web-Adapter variant
-# for full MCP support.)
-# ---------------------------------------------------------------------------
-from mangum import Mangum  # noqa: E402
+app = Starlette(routes=[
+    Route("/", ui, methods=["GET"]),
+    Route("/health", health, methods=["GET"]),
+    Route("/chat", chat, methods=["POST", "OPTIONS"]),
+    Route("/mcp", mcp_endpoint, methods=["POST", "OPTIONS"]),
+])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 handler = Mangum(app, lifespan="off")
-

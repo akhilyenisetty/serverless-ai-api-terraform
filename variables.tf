@@ -66,3 +66,17 @@ variable "llm_api_key" {
   default     = ""
   sensitive   = true
 }
+
+# External MCP servers the chat can connect to (option C). The chat discovers each
+# server's tools and can call them. Example:
+#   external_mcp_servers = [{ name = "whatsapp", url = "https://.../mcp", auth = "token" }]
+variable "external_mcp_servers" {
+  description = "List of external MCP servers {name, url, auth} the chat agent can use."
+  type = list(object({
+    name = string
+    url  = string
+    auth = optional(string, "")
+  }))
+  default   = []
+  sensitive = true # auth tokens
+}

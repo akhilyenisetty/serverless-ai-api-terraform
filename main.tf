@@ -35,6 +35,8 @@ module "lambda" {
   llm_model        = var.llm_model
   llm_base_url     = var.llm_base_url
   secret_arn       = length(aws_secretsmanager_secret.llm) > 0 ? aws_secretsmanager_secret.llm[0].arn : ""
+
+  external_mcp_servers_json = jsonencode(var.external_mcp_servers)
 }
 
 module "api" {

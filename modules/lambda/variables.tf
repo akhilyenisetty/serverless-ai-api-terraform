@@ -44,3 +44,9 @@ variable "secret_arn" {
   type        = string
   default     = ""
 }
+
+variable "external_mcp_servers_json" {
+  description = "JSON string: list of external MCP servers the chat agent can connect to."
+  type        = string
+  default     = "[]"
+}

@@ -26,22 +26,24 @@ Built as a focused project to learn Terraform / Infrastructure-as-Code by solvin
 
 ## Architecture
 
+```mermaid
+flowchart TD
+  U["Any device browser (chat UI)"] -->|HTTPS| G
+  C["Claude Desktop / Cursor (MCP client)"] -->|HTTPS| G
+  G["API Gateway (HTTP API)"] --> L["AWS Lambda — Python zip via Mangum"]
+  L --> UI["GET / — chat UI"]
+  L --> CH["POST /chat — agentic tool-use loop"]
+  L --> MC["POST /mcp — MCP server (stateless JSON-RPC)"]
+  CH --> BR["AWS Bedrock (Converse) — runs in your AWS"]
+  CH --> BK["BYO key: Anthropic / OpenAI / Grok / HF"]
+  BK -.-> SM["Secrets Manager (API key)"]
+  CH --> EXT["External MCP servers (e.g. WhatsApp)"]
+  CH --> DB[("DynamoDB — chat memory + notes")]
+  MC --> DB
+  L --> CW["CloudWatch — logs + alarm"]
 ```
-   Any device's browser / app  ─┐
-   Claude · Cursor · Copilot   ─┤  HTTPS
-                                ▼
-                        API Gateway (HTTP API)
-                                │
-                                ▼
-                    AWS Lambda  (ZIP package, Python runtime, via Mangum)
-                     ├─ POST /chat  → compute backend:
-                     │                  • AWS Bedrock           (runs in your AWS)
-                     │                  • bring-your-own-key    (Anthropic/OpenAI/Grok/HF, key in Secrets Manager)
-                     ├─ POST /mcp   → remote MCP tools
-                     └─ reads/writes DynamoDB (chat memory + MCP notes)
 
-   State: S3 backend + DynamoDB lock       Observability: CloudWatch logs + error alarm
-```
+<sub>State is stored remotely (S3 backend + DynamoDB lock). GitHub renders the diagram above; it also appears as text in the raw file.</sub>
 
 ## Deploy it
 
@@ -89,6 +91,56 @@ light use. Bedrock and any BYO provider are pay-per-token. `terraform destroy` w
 | `byok` | The provider you choose | Yes (stored in Secrets Manager) | Using a specific model / your existing key |
 | self-hosted GPU | Your own GPU instance | No | Full open-weights control *(optional, later stage, costly)* |
 
+## Extending it: add your own tools / MCP servers
+
+There are two ways to give the chat (and external MCP clients) new capabilities.
+
+### Option 1, add a tool directly to this server (runs in your Lambda)
+Best for simple tools. Edit `app/mcp_server.py`:
+
+1. Add a tool spec to `MCP_TOOLS`:
+   ```python
+   {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+   }
+   ```
+2. Write the function it calls:
+   ```python
+   def _tool_get_weather(city):
+       # ... your logic (call an API, read DynamoDB, etc.) ...
+       return {"city": city, "tempC": 21}
+   ```
+3. Route it in `_run_tool`:
+   ```python
+   if name == "get_weather":
+       return _tool_get_weather(args.get("city", ""))
+   ```
+4. `terraform apply`. The tool is now usable by the **chat** (it will call it automatically when relevant) *and* by any external MCP client connected to `/mcp`.
+
+### Option 2, connect an external MCP server you run (e.g. a WhatsApp MCP)
+Best when the tool is its own service. Your external server must speak stateless JSON-RPC
+MCP over HTTP (`initialize`, `tools/list`, `tools/call`), exactly like this project's `/mcp`.
+
+1. Deploy your MCP server somewhere with an HTTPS URL (another copy of this template works).
+2. Create `terraform.tfvars` (gitignored, so tokens stay out of your repo):
+   ```hcl
+   compute_backend = "bedrock"
+   external_mcp_servers = [
+     { name = "whatsapp", url = "https://your-whatsapp-mcp.example.com/mcp", auth = "token-if-any" }
+   ]
+   ```
+3. `terraform apply`. On the next chat, the agent discovers that server's tools, merges them
+   with the local ones, and routes any calls to it, so you can say "text mom I'll be late" and
+   the model calls your WhatsApp MCP. A down server is skipped (never breaks chat); local tools
+   win on name clashes.
+
+### How the chat uses tools
+On the Bedrock backend the chat runs a **tool-use loop**: it sends all tools (local + external)
+to the model; if the model asks for one, the app runs it (or forwards it to the external server),
+feeds the result back, and repeats until the model answers. (BYO-key mode is plain chat for now.)
+
 ## What it demonstrates (for reviewers / interviews)
 - **Terraform / IaC:** providers, resources, reusable **modules**, variables with validation, outputs,
   **remote state** (S3 + DynamoDB lock), and **conditional resources** (secret only in byok mode).
@@ -124,8 +176,11 @@ Python · Mangum · MCP (Model Context Protocol)
 - ✅ `/chat` agent with **Bedrock or BYO-key** compute + DynamoDB conversation memory
 - ✅ **Browser chat UI** served from the Lambda (open `ui_url`) — a weak laptop just needs this page
 - ✅ Model-agnostic compute via the **Bedrock Converse API** (Claude / Nova / Llama by one variable)
+- ✅ Remote **MCP server at `/mcp`** (stateless JSON-RPC, works on Lambda; no `mcp` library needed)
+- ✅ **Agentic chat** (Bedrock): the chat calls your tools via a tool-use loop
+- ✅ **External MCP clients**: point the chat at other MCP servers you run (e.g. a WhatsApp MCP) via `external_mcp_servers`
 - ✅ GitHub Actions CI (fmt + validate + Python syntax on every push/PR)
-- ⬜ Optional self-hosted GPU model (open-weights)  ·  ℹ️ `/mcp` bonus needs the container/Web-Adapter path
+- ⬜ Optional self-hosted GPU model (open-weights)
 
 ## What I learned
 A few honest takeaways from building this:
@@ -135,9 +190,10 @@ A few honest takeaways from building this:
   statements per mode (Bedrock vs. BYO-key) keeps the policy least-privilege instead of over-granting.
 - **Packaging without Docker.** I package the Lambda as a zip and vendor Linux wheels with pip's
   `--platform`/`--only-binary` flags, so it builds on macOS and runs on Lambda with no container step.
-- **ASGI on Lambda has sharp edges.** Mangum adapts the web app to Lambda cleanly, but the MCP server's
-  session-manager lifespan can only start once per instance, which Mangum re-runs per invocation, so I
-  disabled the lifespan for the serverless path (the `/mcp` bonus needs a long-lived server/container).
+- **ASGI on Lambda has sharp edges.** Mangum adapts the web app to Lambda cleanly, but a long-lived MCP
+  session manager can't run in Lambda's request/response model. I implemented the MCP server as a
+  **stateless JSON-RPC handler** (initialize / tools/list / tools/call) instead, which works on Lambda and
+  dropped the heavy `mcp` dependency entirely.
 - **Bedrock realities.** Newer Claude models require a cross-region **inference profile** (`us.`-prefixed
   id), and Anthropic models need a one-time use-case form per account. Moving to the **Converse API** made
   the code model-agnostic, so swapping between Claude, Nova, or Llama is a one-variable change.

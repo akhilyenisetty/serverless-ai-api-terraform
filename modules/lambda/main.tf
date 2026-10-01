@@ -114,8 +114,9 @@ resource "aws_lambda_function" "mcp" {
       BEDROCK_MODEL_ID = var.bedrock_model_id
       LLM_PROVIDER     = var.llm_provider
       LLM_MODEL        = var.llm_model
-      LLM_BASE_URL     = var.llm_base_url
-      SECRET_ARN       = var.secret_arn
+      LLM_BASE_URL          = var.llm_base_url
+      SECRET_ARN            = var.secret_arn
+      EXTERNAL_MCP_SERVERS  = var.external_mcp_servers_json
     }
   }
 
