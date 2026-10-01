@@ -1,0 +1,30 @@
+name: terraform
+
+# Runs on every push and PR: proves the Terraform is formatted and valid before merge.
+# No AWS credentials needed, `validate` runs offline with `init -backend=false`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Python syntax check
+        run: python3 -m py_compile app/mcp_server.py
